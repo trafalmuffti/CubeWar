@@ -50,6 +50,22 @@ stock Windows 10/11 machine with no extra DLLs. A GitHub Actions workflow in
 `.github/workflows/build.yml` performs the same cross-build and uploads the
 `.exe` as an artifact.
 
+## Debug / automation
+
+Two environment variables exist for testing without a human at the controls:
+
+| Variable | Effect |
+|----------|--------|
+| `CUBEWAR_AUTOPILOT=1` | The ship aims itself at the cube and fires every 1.5 s |
+| `CUBEWAR_SCREENSHOT_DIR=<dir>` | Saves `frame_NNN.png` screenshots to `<dir>`; `CUBEWAR_SCREENSHOT_EVERY` sets the interval in seconds (default 2) |
+
+Example headless smoke test on Linux with Mesa's software Vulkan driver:
+
+```sh
+mkdir -p shots
+CUBEWAR_AUTOPILOT=1 CUBEWAR_SCREENSHOT_DIR=shots timeout 60 xvfb-run cargo run
+```
+
 ## Requirements
 
 Rust 1.95 or newer (Bevy 0.19).

@@ -12,6 +12,8 @@
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
+use bevy::render::view::window::screenshot::{save_to_disk, Screenshot};
+use bevy::camera::Hdr;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
@@ -114,6 +116,22 @@ struct Assets3d {
     core_material: Handle<StandardMaterial>,
 }
 
+/// Debug aid (`CUBEWAR_AUTOPILOT=1`): the ship aims itself at the cube and
+/// fires on a fixed cadence, so the hit progression can be exercised without input.
+#[derive(Resource)]
+struct Autopilot {
+    fire: Timer,
+    fire_now: bool,
+}
+
+/// Debug aid (`CUBEWAR_SCREENSHOT_DIR=<dir>`): saves a PNG every `CUBEWAR_SCREENSHOT_EVERY` seconds (default 2).
+#[derive(Resource)]
+struct ScreenshotDir {
+    dir: std::path::PathBuf,
+    every: Timer,
+    index: u32,
+}
+
 /// Tiny deterministic xorshift RNG so the demo has no extra dependencies.
 #[derive(Resource)]
 struct Rng(u64);
@@ -150,8 +168,9 @@ impl Rng {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
+    let mut app = App::new();
+    debug_config(&mut app);
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "CubeWar".into(),
                 ..default()
@@ -168,6 +187,7 @@ fn main() {
             (
                 toggle_cursor,
                 mouse_look,
+                autopilot,
                 fire_laser,
                 move_lasers,
                 move_cube,
@@ -176,10 +196,32 @@ fn main() {
                 update_explosions,
                 respawn_cube,
                 update_hud,
+                take_screenshots,
             )
                 .chain(),
         )
         .run();
+}
+
+/// Reads the debug environment variables and installs the matching resources.
+fn debug_config(app: &mut App) {
+    if std::env::var_os("CUBEWAR_AUTOPILOT").is_some() {
+        app.insert_resource(Autopilot {
+            fire: Timer::from_seconds(1.5, TimerMode::Repeating),
+            fire_now: false,
+        });
+    }
+    if let Some(dir) = std::env::var_os("CUBEWAR_SCREENSHOT_DIR") {
+        let every = std::env::var("CUBEWAR_SCREENSHOT_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(2.0);
+        app.insert_resource(ScreenshotDir {
+            dir: dir.into(),
+            every: Timer::from_seconds(every, TimerMode::Repeating),
+            index: 0,
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,9 +289,11 @@ fn setup(
 
     // --- Camera / cockpit ----------------------------------------------
     let cockpit_dark = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.05, 0.05, 0.06),
-        perceptual_roughness: 0.8,
-        metallic: 0.3,
+        base_color: Color::srgb(0.06, 0.06, 0.075),
+        perceptual_roughness: 0.95,
+        metallic: 0.0,
+        // The cockpit is always in the ship's shadow; keep it from being washed out by the sun.
+        unlit: true,
         ..default()
     });
     let cockpit_glow = materials.add(StandardMaterial {
@@ -264,10 +308,7 @@ fn setup(
     commands
         .spawn((
             Camera3d::default(),
-            Camera {
-                hdr: true,
-                ..default()
-            },
+            Hdr,
             Bloom::NATURAL,
             Projection::from(PerspectiveProjection {
                 fov: 75f32.to_radians(),
@@ -295,7 +336,7 @@ fn setup(
             cam.spawn((
                 Mesh3d(panel.clone()),
                 MeshMaterial3d(cockpit_dark.clone()),
-                Transform::from_xyz(0.0, -0.62, -1.1)
+                Transform::from_xyz(0.0, -0.7, -1.15)
                     .with_rotation(Quat::from_rotation_x(0.35))
                     .with_scale(Vec3::new(2.6, 1.0, 1.0)),
             ));
@@ -303,7 +344,7 @@ fn setup(
                 cam.spawn((
                     Mesh3d(light_strip.clone()),
                     MeshMaterial3d(cockpit_glow.clone()),
-                    Transform::from_xyz(x, -0.53, -0.95).with_rotation(Quat::from_rotation_x(0.35)),
+                    Transform::from_xyz(x, -0.59, -1.0).with_rotation(Quat::from_rotation_x(0.35)),
                 ));
             }
         });
@@ -312,7 +353,7 @@ fn setup(
     commands.spawn((
         DirectionalLight {
             illuminance: 9_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_xyz(60.0, 100.0, 40.0).looking_at(Vec3::ZERO, Vec3::Y),
@@ -321,7 +362,7 @@ fn setup(
         DirectionalLight {
             illuminance: 1_500.0,
             color: Color::srgb(0.5, 0.6, 1.0),
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_xyz(-80.0, -30.0, -60.0).looking_at(Vec3::ZERO, Vec3::Y),
@@ -348,7 +389,7 @@ fn setup(
     commands.spawn((
         Text::new(""),
         TextFont {
-            font_size: 22.0,
+            font_size: FontSize::Px(22.0),
             ..default()
         },
         TextColor(Color::srgb(0.6, 0.9, 1.0)),
@@ -363,7 +404,7 @@ fn setup(
     commands.spawn((
         Text::new("Mouse: aim   LMB / Space: fire   Esc: release cursor"),
         TextFont {
-            font_size: 16.0,
+            font_size: FontSize::Px(16.0),
             ..default()
         },
         TextColor(Color::srgba(0.7, 0.8, 0.9, 0.7)),
@@ -593,11 +634,17 @@ fn fire_laser(
     cursor: Single<&CursorOptions, With<PrimaryWindow>>,
     assets: Res<Assets3d>,
     mut player: Single<(&Transform, &mut Player)>,
+    mut autopilot: Option<ResMut<Autopilot>>,
 ) {
     let (transform, player) = &mut *player;
     player.fire_cooldown.tick(time.delta());
 
-    let wants_fire = keys.pressed(KeyCode::Space)
+    let auto_fire = autopilot
+        .as_mut()
+        .map(|a| std::mem::take(&mut a.fire_now))
+        .unwrap_or(false);
+    let wants_fire = auto_fire
+        || keys.pressed(KeyCode::Space)
         || (cursor.grab_mode != CursorGrabMode::None && mouse.pressed(MouseButton::Left));
     if !wants_fire || !player.fire_cooldown.is_finished() {
         return;
@@ -623,6 +670,49 @@ fn fire_laser(
                 life: Timer::from_seconds(LASER_LIFETIME, TimerMode::Once),
             },
         ));
+    }
+}
+
+/// Debug autopilot: swing the view onto the cube and pull the trigger periodically.
+fn autopilot(
+    time: Res<Time>,
+    autopilot: Option<ResMut<Autopilot>>,
+    cubes: Query<&Transform, (With<Cube>, Without<Player>)>,
+    mut player: Single<(&mut Transform, &mut Player)>,
+) {
+    let Some(mut auto) = autopilot else {
+        return;
+    };
+    let (transform, player) = &mut *player;
+    if let Ok(cube) = cubes.single() {
+        let dir = (cube.translation - transform.translation).normalize_or(Vec3::NEG_Z);
+        let target_yaw = (-dir.x).atan2(-dir.z);
+        let target_pitch = dir.y.clamp(-1.0, 1.0).asin();
+        let k = (time.delta_secs() * 4.0).min(1.0);
+        let mut dyaw = target_yaw - player.yaw;
+        dyaw = (dyaw + PI).rem_euclid(TAU) - PI;
+        player.yaw += dyaw * k;
+        player.pitch += (target_pitch - player.pitch) * k;
+        transform.rotation = Quat::from_euler(EulerRot::YXZ, player.yaw, player.pitch, 0.0);
+        auto.fire.tick(time.delta());
+        if auto.fire.just_finished() && dyaw.abs() < 0.03 {
+            auto.fire_now = true;
+        }
+    }
+}
+
+/// Debug screenshots: dump the primary window to `<dir>/frame_NNN.png` on a timer.
+fn take_screenshots(mut commands: Commands, time: Res<Time>, shots: Option<ResMut<ScreenshotDir>>) {
+    let Some(mut shots) = shots else {
+        return;
+    };
+    shots.every.tick(time.delta());
+    if shots.every.just_finished() {
+        let path = shots.dir.join(format!("frame_{:03}.png", shots.index));
+        shots.index += 1;
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path));
     }
 }
 
@@ -714,7 +804,7 @@ fn laser_hits(
                     } else {
                         Visibility::Hidden
                     };
-                    if let Some(mat) = materials.get_mut(&material.0) {
+                    if let Some(mut mat) = materials.get_mut(&material.0) {
                         *mat = shield_material_for(cube.hits);
                     }
                     commands.entity(child).insert(ShieldFlash(1.0));
@@ -755,7 +845,7 @@ fn shield_flash(
         let f = flash.0.max(0.0);
         // Pulse the shell size a little on impact.
         transform.scale = Vec3::splat(1.0 + f * 0.06);
-        if let Some(mat) = materials.get_mut(&material.0) {
+        if let Some(mut mat) = materials.get_mut(&material.0) {
             let base = shield_material_for(cube.hits);
             mat.emissive = base.emissive * (1.0 + f * 2.5);
             if cube.hits == 3 {
@@ -810,7 +900,7 @@ fn spawn_explosion(commands: &mut Commands, assets: &Assets3d, rng: &mut Rng, at
             color: Color::srgb(1.0, 0.6, 0.25),
             intensity: 40_000_000.0,
             range: 200.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_translation(at),
