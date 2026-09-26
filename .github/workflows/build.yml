@@ -1,0 +1,23 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-from-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 libasound2-dev libudev-dev
+          rustup target add x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Windows executable
+        run: ./build-windows.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cubewar-windows
+          path: dist/cubewar.exe

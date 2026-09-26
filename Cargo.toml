@@ -1,0 +1,22 @@
+[package]
+name = "cubewar"
+version = "0.1.0"
+edition = "2021"
+description = "First-person space shooter demo: blast Borg-inspired cube ships through their shields."
+license = "MIT"
+
+[dependencies]
+bevy = "0.19"
+
+# Faster iteration: optimise dependencies (Bevy) even in dev builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
